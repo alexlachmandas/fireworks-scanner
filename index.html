@@ -463,6 +463,16 @@ const DEFAULT_CONFIG = {
   casePackField: 'Case Pack'
 };
 
+const FIELDS = {
+  barcode: 'case barcode',
+  name: 'Item Name',
+  casePack: 'Case Pack',
+  brand: 'Brand',
+  type: 'Type',
+  casePrice: 'Wholesale Case Price',
+  unitPrice: 'Wholesale Unit Price'
+};
+
 let config = JSON.parse(localStorage.getItem('fw_config') || 'null') || DEFAULT_CONFIG;
 let cart = {};
 let inventory = {};
