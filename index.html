@@ -473,6 +473,13 @@ const FIELDS = {
   unitPrice: 'Wholesale Unit Price'
 };
 
+// Clear old cached config if it's outdated
+const CONFIG_VERSION = '2';
+if (localStorage.getItem('fw_config_version') !== CONFIG_VERSION) {
+  localStorage.removeItem('fw_config');
+  localStorage.setItem('fw_config_version', CONFIG_VERSION);
+}
+
 let config = JSON.parse(localStorage.getItem('fw_config') || 'null') || DEFAULT_CONFIG;
 let cart = {};
 let inventory = {};
