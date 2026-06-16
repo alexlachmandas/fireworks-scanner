@@ -882,7 +882,8 @@ async function loadInventory() {
     statusDot.style.background = 'var(--success)';
     statusDot.style.boxShadow = '0 0 8px var(--success)';
     const missing = allProducts.filter(p => !p.barcode).length;
-    statusText.textContent = `${allProducts.length} products · ${count} barcodes` + (missing ? ` · ${missing} missing` : '');
+    const barcoded = allProducts.length - missing;
+    statusText.textContent = `${allProducts.length} products · ${barcoded} with barcode` + (missing ? ` · ${missing} missing` : '');
     updateAssignCounter();
 
   } catch (e) {
