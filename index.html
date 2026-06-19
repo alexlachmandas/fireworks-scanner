@@ -217,6 +217,20 @@
   }
   .clear-btn:hover { background: rgba(255,79,79,0.1); }
 
+  .order-select {
+    width: 100%;
+    background: var(--bg);
+    border: 1px solid var(--border-bright);
+    border-radius: 8px;
+    padding: 11px 12px;
+    font-size: 14px;
+    font-family: var(--mono);
+    color: var(--text);
+    outline: none;
+    cursor: pointer;
+  }
+  .order-select:focus { border-color: var(--accent); }
+
   /* Edit-item modal */
   .edit-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.85); display: none; align-items: center; justify-content: center; z-index: 170; }
   .edit-box { background: var(--surface); border: 1px solid var(--border-bright); border-radius: 14px; padding: 1.5rem; width: 380px; max-width: 92vw; }
@@ -465,9 +479,12 @@
 
   <!-- Cart panel -->
   <div class="right">
-    <div class="cart-header">
-      <span class="cart-title">&#9776; Session Cart</span>
-      <button class="clear-btn" onclick="clearCart()">Clear all</button>
+    <div class="cart-header" style="flex-direction:column;align-items:stretch;gap:8px">
+      <div style="display:flex;justify-content:space-between;align-items:center;">
+        <span class="cart-title">&#9776; Order</span>
+        <button class="clear-btn" onclick="clearCart()">Clear this order</button>
+      </div>
+      <select id="order-select" class="order-select" onchange="switchOrder(this.value)"></select>
     </div>
     <div class="cart-items" id="cart-items">
       <div class="loading-msg" style="margin-top:2rem">No items scanned yet</div>
@@ -598,6 +615,9 @@ if (localStorage.getItem('fw_config_version') !== CONFIG_VERSION) {
 
 let config = JSON.parse(localStorage.getItem('fw_config') || 'null') || DEFAULT_CONFIG;
 let cart = {};
+const ORDERS = ['Jeremy1','Jeremy2','Jeremy3','Nik','Vik','Jackson'];
+let orders = {};        // order name -> { barcode: item } ; each is an independent running order
+let currentOrder = ORDERS[0];
 let inventory = {};
 let duplicateBarcodes = {};
 let loaded = false;
@@ -642,8 +662,9 @@ function addManualItem() {
   if (!name) { errEl.textContent = 'Item name is required.'; errEl.style.display = 'block'; return; }
   errEl.style.display = 'none';
   const key = 'MANUAL-' + Date.now();
-  cart[key] = { barcode: 'MANUAL', name, brand, type: 'Manual Entry', casePack: '', casePrice: price, unitPrice: 0, qty, ts: Date.now() };
+  cart[key] = { barcode: key, name, brand, type: 'Manual Entry', casePack: '', casePrice: price, unitPrice: 0, qty, ts: Date.now() };
   updateCart();
+  upsertLine(key);
   document.getElementById('manual-name').value = '';
   document.getElementById('manual-price').value = '';
   document.getElementById('manual-brand').value = '';
@@ -816,7 +837,13 @@ async function saveConfig() {
   await loadInventory();
 }
 
-async function loadInventory() {
+let _invLoading = null;
+function loadInventory() {
+  if (_invLoading) return _invLoading;
+  _invLoading = _loadInventoryImpl().finally(() => { _invLoading = null; });
+  return _invLoading;
+}
+async function _loadInventoryImpl() {
   const errEl = document.getElementById('cfg-error');
   const statusDot = document.getElementById('status-dot');
   const statusText = document.getElementById('status-text');
@@ -915,6 +942,8 @@ async function loadInventory() {
     const barcoded = allProducts.length - missing;
     statusText.textContent = `${allProducts.length} products · ${barcoded} with barcode` + (missing ? ` · ${missing} missing` : '');
     updateAssignCounter();
+    fetchAllOrders();
+    startAutoRefresh();
 
   } catch (e) {
     if (errEl) { errEl.style.color = 'var(--danger)'; errEl.textContent = `Error: ${e.message}`; }
@@ -1002,6 +1031,131 @@ function processBarcode(barcode) {
   // store casePrice alias for cart
   cart[item.barcode].casePrice = item.casePrice;
   updateCart();
+  upsertLine(item.barcode);
+}
+
+// ---- Multi-order management (Airtable-backed, syncs across devices) ----
+const orderTable = (o) => 'Fireworks ' + o;
+const fwUrl = (o) => `https://api.airtable.com/v0/${config.base}/${encodeURIComponent(orderTable(o))}`;
+const authHeaders = () => ({ 'Authorization': `Bearer ${config.token}`, 'Content-Type': 'application/json' });
+let pendingWrites = 0;
+let refreshTimer = null;
+
+function initOrders() {
+  orders = {};
+  for (const o of ORDERS) orders[o] = {};
+  const savedCur = localStorage.getItem('fw_current_order');
+  currentOrder = (savedCur && ORDERS.includes(savedCur)) ? savedCur : ORDERS[0];
+  cart = orders[currentOrder];
+}
+function rememberOrder() { try { localStorage.setItem('fw_current_order', currentOrder); } catch (e) {} }
+function orderQty(o) { return Object.values(orders[o] || {}).reduce((s, i) => s + i.qty, 0); }
+function orderTotal(o) { return Object.values(orders[o] || {}).reduce((s, i) => s + i.qty * (i.casePrice || 0), 0); }
+function renderOrderSelect() {
+  const sel = document.getElementById('order-select');
+  if (!sel) return;
+  sel.innerHTML = ORDERS.map(o => {
+    const q = orderQty(o), t = orderTotal(o);
+    const tag = q ? `${q} cs · $${t.toFixed(2)}` : 'empty';
+    return `<option value="${o}">${o} — ${tag}</option>`;
+  }).join('');
+  sel.value = currentOrder;
+}
+function setSyncStatus(msg) { const el = document.getElementById('status-text'); if (el) el.textContent = msg; }
+
+function itemFromRecord(rec) {
+  const f = rec.fields || {};
+  const bc = (f['Barcode'] != null ? String(f['Barcode']) : '');
+  const inv = inventory[bc];
+  return {
+    barcode: bc,
+    name: f['Item'] || (inv && inv.name) || 'Unknown',
+    casePrice: (f['Price'] != null ? f['Price'] : (inv ? inv.casePrice : 0)) || 0,
+    unitPrice: inv ? inv.unitPrice : 0,
+    brand: inv ? inv.brand : '',
+    type: inv ? inv.type : '',
+    casePack: inv ? inv.casePack : '',
+    qty: f['Qty'] || 0,
+    airtableId: rec.id,
+    ts: rec.createdTime ? Date.parse(rec.createdTime) : Date.now()
+  };
+}
+
+async function fetchOrder(o) {
+  const built = {};
+  let offset = null;
+  do {
+    let url = fwUrl(o) + '?pageSize=100';
+    if (offset) url += '&offset=' + offset;
+    const res = await fetch(url, { headers: authHeaders() });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const data = await res.json();
+    for (const rec of data.records) {
+      const it = itemFromRecord(rec);
+      built[it.barcode || rec.id] = it;
+    }
+    offset = data.offset;
+  } while (offset);
+  const local = orders[o] || {};
+  for (const key in local) {
+    if (!local[key].airtableId && !built[key]) built[key] = local[key];
+  }
+  orders[o] = built;
+  if (o === currentOrder) cart = orders[o];
+}
+
+async function fetchAllOrders() {
+  if (!loaded || pendingWrites > 0) return;
+  await Promise.all(ORDERS.map(o => fetchOrder(o).catch(() => {})));
+  if (pendingWrites > 0) return;
+  cart = orders[currentOrder];
+  renderOrderSelect();
+  updateCart();
+}
+
+function startAutoRefresh() {
+  if (refreshTimer) clearInterval(refreshTimer);
+  refreshTimer = setInterval(() => { if (loaded && pendingWrites === 0) fetchAllOrders(); }, 20000);
+}
+
+async function upsertLine(key) {
+  const it = cart[key];
+  if (!it || !loaded) return;
+  if (it._writing) { it._dirty = true; return; }
+  it._writing = true;
+  const o = currentOrder;
+  pendingWrites++;
+  try {
+    do {
+      it._dirty = false;
+      if (it.airtableId) {
+        await fetch(fwUrl(o) + '/' + it.airtableId, { method: 'PATCH', headers: authHeaders(), body: JSON.stringify({ fields: { Qty: it.qty, Price: it.casePrice } }) });
+      } else {
+        const res = await fetch(fwUrl(o), { method: 'POST', headers: authHeaders(), body: JSON.stringify({ fields: { Item: it.name || '', Barcode: it.barcode || '', Qty: it.qty || 0, Price: it.casePrice || 0 } }) });
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const data = await res.json();
+        if (data && data.id) it.airtableId = data.id;
+      }
+    } while (it._dirty);
+  } catch (e) {
+    setSyncStatus('⚠ NOT saving to Airtable — token is read-only (open ⚙, use a read+write token)');
+  } finally {
+    it._writing = false;
+    pendingWrites--;
+  }
+}
+
+function switchOrder(o) {
+  if (!ORDERS.includes(o)) return;
+  currentOrder = o;
+  cart = orders[currentOrder];
+  rememberOrder();
+  updateCart();
+  const card = document.getElementById('item-card');
+  card.className = 'item-card empty';
+  card.innerHTML = `<div class="empty-icon">&#127748;</div><div class="empty-text">Scanning into <b style="color:var(--accent)">${o}</b> — saved to Airtable, synced across devices</div>`;
+  barcodeInput.focus();
+  if (loaded) fetchOrder(o).then(() => { renderOrderSelect(); updateCart(); }).catch(() => {});
 }
 
 function updateCart() {
@@ -1013,6 +1167,8 @@ function updateCart() {
   document.getElementById('skus').textContent = items.length;
   document.getElementById('total-top').textContent = '$' + totalPrice.toFixed(2);
   document.getElementById('total-amount').textContent = '$' + totalPrice.toFixed(2);
+
+  renderOrderSelect();
 
   const container = document.getElementById('cart-items');
   if (!items.length) {
@@ -1063,23 +1219,48 @@ function saveEditItem() {
   const q = parseInt(document.getElementById('edit-item-qty').value) || 0;
   if (q <= 0) { deleteEditItem(); return; }
   cart[key].qty = q;
-  closeEditItem();
+  document.getElementById('edit-item-overlay').style.display = 'none';
+  editItemKey = null;
   updateCart();
+  upsertLine(key);
+  barcodeInput.focus();
 }
-function deleteEditItem() {
+async function deleteEditItem() {
   const key = editItemKey;
   if (!key || !cart[key]) { closeEditItem(); return; }
+  const aid = cart[key].airtableId;
   delete cart[key];
-  closeEditItem();
+  document.getElementById('edit-item-overlay').style.display = 'none';
+  editItemKey = null;
   updateCart();
+  if (aid) {
+    pendingWrites++;
+    try { await fetch(fwUrl(currentOrder) + '/' + aid, { method: 'DELETE', headers: authHeaders() }); }
+    catch (e) { setSyncStatus('⚠ delete did not sync'); }
+    finally { pendingWrites--; }
+  }
+  barcodeInput.focus();
 }
 
-function clearCart() {
-  cart = {};
+async function clearCart() {
+  const o = currentOrder;
+  const n = orderQty(o);
+  if (!confirm('Clear all ' + n + ' case' + (n === 1 ? '' : 's') + ' from the ' + o + ' order? This deletes them from Airtable too. Other orders are not affected.')) return;
+  const ids = Object.values(orders[o]).map(i => i.airtableId).filter(Boolean);
+  orders[o] = {};
+  cart = orders[currentOrder];
   updateCart();
   const card = document.getElementById('item-card');
   card.className = 'item-card empty';
   card.innerHTML = `<div class="empty-icon">&#127748;</div><div class="empty-text">Scan a barcode to see item details</div>`;
+  pendingWrites++;
+  try {
+    for (let i = 0; i < ids.length; i += 10) {
+      const qs = ids.slice(i, i + 10).map(id => 'records[]=' + id).join('&');
+      await fetch(fwUrl(o) + '?' + qs, { method: 'DELETE', headers: authHeaders() });
+    }
+  } catch (e) { setSyncStatus('⚠ clear did not fully sync'); }
+  finally { pendingWrites--; }
 }
 
 function exportCart() {
@@ -1089,11 +1270,11 @@ function exportCart() {
   items.forEach(i => rows.push([i.barcode, i.name, i.brand, i.type, i.casePack, i.unitPrice.toFixed(2), i.casePrice.toFixed(2), i.qty, (i.qty*i.casePrice).toFixed(2)]));
   const total = items.reduce((s,i) => s + i.qty*i.casePrice, 0);
   rows.push(['','','','','TOTAL', total.toFixed(2)]);
-  const csv = rows.map(r => r.map(v => `"${v}"`).join(',')).join('\n');
+  const csv = 'Order:,' + currentOrder + '\n' + rows.map(r => r.map(v => `"${v}"`).join(',')).join('\n');
   const blob = new Blob([csv], { type: 'text/csv' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
-  a.href = url; a.download = `fireworks-scan-${new Date().toISOString().slice(0,10)}.csv`;
+  a.href = url; a.download = `fireworks-${currentOrder}-${new Date().toISOString().slice(0,10)}.csv`;
   a.click();
   URL.revokeObjectURL(url);
 }
@@ -1104,6 +1285,8 @@ document.getElementById('barcode-input').addEventListener('keydown', e => {
 });
 
 // Init
+initOrders();
+updateCart();
 fillConfigForm();
 if (config.token && config.base && config.table) {
   loadInventory();
