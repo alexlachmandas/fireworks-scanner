@@ -871,6 +871,7 @@ async function _loadInventoryImpl() {
   try {
     inventory = {};
     allProducts = [];
+    duplicateBarcodes = {};
     let offset = null;
     let page = 0;
 
@@ -906,21 +907,22 @@ async function _loadInventoryImpl() {
         });
         if (barcode) {
           const bKey = String(barcode).trim();
-          if (inventory[bKey]) {
-            if (!duplicateBarcodes[bKey]) {
-              duplicateBarcodes[bKey] = [{ name: inventory[bKey].name, brand: inventory[bKey].brand, casePrice: inventory[bKey].casePrice }];
-            }
-            duplicateBarcodes[bKey].push({ name: f[FIELDS.name] || 'Unknown', brand: f[FIELDS.brand] || '', casePrice: parseFloat(f[FIELDS.casePrice]) || 0 });
-          }
-          inventory[bKey] = {
+          const item = {
             name: f[FIELDS.name] || f['Item Name'] || 'Unknown Item',
             casePrice: parseFloat(f[FIELDS.casePrice] || f['Wholesale Case Price']) || 0,
             unitPrice: parseFloat(f[FIELDS.unitPrice] || f['Wholesale Unit Price']) || 0,
             brand: f[FIELDS.brand] || f['Brand'] || '',
             type: f[FIELDS.type] || f['Type'] || '',
             casePack: f[FIELDS.casePack] || f['Case Pack'] || '',
-            barcode: bKey
+            barcode: bKey,
+            id: rec.id
           };
+          // multiple products can share one barcode — keep every match so the user can pick
+          if (inventory[bKey]) {
+            if (!duplicateBarcodes[bKey]) duplicateBarcodes[bKey] = [inventory[bKey]];
+            duplicateBarcodes[bKey].push(item);
+          }
+          inventory[bKey] = item;
         }
       }
       statusText.textContent = 'Loading... ' + Object.keys(inventory).length + ' items';
@@ -940,23 +942,16 @@ async function _loadInventoryImpl() {
       return;
     }
 
-    // Check for duplicate barcodes
-    duplicateBarcodes = {};
-    const barcodeCount = {};
-    for (const rec of Object.values(inventory)) {
-      const b = rec.barcode;
-      barcodeCount[b] = (barcodeCount[b] || 0) + 1;
-    }
-    // Since inventory dedupes by barcode key, re-scan raw records
-    // We'll track dupes during the load loop instead - see below
-    
     loaded = true;
     closeConfig();
     statusDot.style.background = 'var(--success)';
     statusDot.style.boxShadow = '0 0 8px var(--success)';
     const missing = allProducts.filter(p => !p.barcode).length;
     const barcoded = allProducts.length - missing;
-    statusText.textContent = `${allProducts.length} products · ${barcoded} with barcode` + (missing ? ` · ${missing} missing` : '');
+    const shared = Object.keys(duplicateBarcodes).length;
+    statusText.textContent = `${allProducts.length} products · ${barcoded} with barcode`
+      + (missing ? ` · ${missing} missing` : '')
+      + (shared ? ` · ${shared} shared` : '');
     updateAssignCounter();
     fetchAllOrders();
     startAutoRefresh();
@@ -998,7 +993,7 @@ function liveSearch(q) {
   if (!list.length) { hideSearch(); return; }
   sr.dataset.top = list[0].id;
   sr.innerHTML = list.map(p => {
-    const key = p.barcode || ('PROD-' + p.id);
+    const key = p.barcode ? dupKey(p.barcode, p.name) : ('PROD-' + p.id);
     const inOrder = cart[key] ? cart[key].qty : 0;
     const sub = (p.brand ? escapeHtml(p.brand) + ' &bull; ' : '') + '$' + (p.casePrice || 0).toFixed(2)
       + (inOrder ? ' &bull; <span style="color:var(--success)">in order: ' + inOrder + '</span>' : '');
@@ -1012,7 +1007,7 @@ function liveSearch(q) {
 function addProductToOrder(id) {
   const p = allProducts.find(x => x.id === id);
   if (!p) return;
-  const key = p.barcode || ('PROD-' + p.id);
+  const key = p.barcode ? dupKey(p.barcode, p.name) : ('PROD-' + p.id);
   if (cart[key]) { cart[key].qty++; }
   else { cart[key] = { barcode: key, name: p.name, casePrice: p.casePrice || 0, unitPrice: p.unitPrice || 0, brand: p.brand || '', type: p.type || '', casePack: p.casePack || '', qty: 1, ts: Date.now() }; }
   updateCart();
@@ -1026,6 +1021,11 @@ function addProductToOrder(id) {
   input.focus();
 }
 
+// products that share a barcode are tracked per-name so each stays its own cart line
+function dupKey(barcode, name) {
+  return duplicateBarcodes[barcode] ? barcode + '##' + (name || '') : barcode;
+}
+
 function processBarcode(barcode) {
   const card = document.getElementById('item-card');
   const zone = document.getElementById('scan-zone');
@@ -1036,14 +1036,10 @@ function processBarcode(barcode) {
     return;
   }
 
-  // Try exact match first, then case-insensitive
-  let item = inventory[barcode] || inventory[barcode.toUpperCase()] || inventory[barcode.toLowerCase()];
-
-  // fuzzy: strip leading zeros or spaces
-  if (!item) {
-    const stripped = barcode.replace(/^0+/, '');
-    item = inventory[stripped];
-  }
+  // Resolve the barcode key: exact, case-insensitive, then leading-zeros stripped
+  const matchKey = [barcode, barcode.toUpperCase(), barcode.toLowerCase(), barcode.replace(/^0+/, '')]
+    .find(k => inventory[k]);
+  let item = matchKey ? inventory[matchKey] : null;
 
   if (!item) {
     card.className = 'item-card not-found';
@@ -1058,6 +1054,9 @@ function processBarcode(barcode) {
     setTimeout(() => zone.classList.remove('flash-error'), 500);
     return;
   }
+
+  // Multiple products share this barcode — let the user pick the right one
+  if (duplicateBarcodes[matchKey]) { showDupeModal(matchKey); return; }
 
   // Show item card
   card.className = 'item-card found';
@@ -1096,6 +1095,50 @@ function processBarcode(barcode) {
   cart[item.barcode].casePrice = item.casePrice;
   updateCart();
   upsertLine(item.barcode);
+}
+
+// ---- Duplicate-barcode picker (one barcode shared by several products) ----
+function showDupeModal(barcode) {
+  const choices = duplicateBarcodes[barcode] || [];
+  document.getElementById('dupe-barcode-label').textContent = barcode + ' · ' + choices.length + ' matching products';
+  document.getElementById('dupe-items').innerHTML = choices.map((c, i) =>
+    '<div class="search-row" onclick="addDupeChoice(\'' + encodeURIComponent(barcode) + '\',' + i + ')">'
+    + '<div><div class="search-row-name">' + escapeHtml(c.name || '(unnamed)') + '</div>'
+    + '<div class="search-row-sub">' + (c.brand ? escapeHtml(c.brand) + ' &bull; ' : '')
+    + (c.type ? escapeHtml(c.type) + ' &bull; ' : '') + '$' + (c.casePrice || 0).toFixed(2) + '</div></div>'
+    + '<div class="search-row-add">+ Add</div></div>'
+  ).join('');
+  document.getElementById('dupe-overlay').style.display = 'flex';
+}
+function closeDupeModal() {
+  document.getElementById('dupe-overlay').style.display = 'none';
+  barcodeInput.value = '';
+  barcodeInput.focus();
+}
+function addDupeChoice(encBarcode, i) {
+  const barcode = decodeURIComponent(encBarcode);
+  const c = (duplicateBarcodes[barcode] || [])[i];
+  if (!c) { closeDupeModal(); return; }
+  const key = dupKey(barcode, c.name);
+  if (cart[key]) cart[key].qty++;
+  else cart[key] = { barcode, name: c.name, casePrice: c.casePrice || 0, unitPrice: c.unitPrice || 0, brand: c.brand || '', type: c.type || '', casePack: c.casePack || '', qty: 1, ts: Date.now() };
+  updateCart();
+  upsertLine(key);
+
+  document.getElementById('dupe-overlay').style.display = 'none';
+  const card = document.getElementById('item-card');
+  card.style.display = '';
+  card.className = 'item-card found';
+  card.innerHTML = '<div class="item-top"><div><div class="item-name">' + escapeHtml(c.name || '') + '</div>'
+    + '<div class="item-sku">' + (c.brand ? escapeHtml(c.brand) + ' &bull; ' : '') + escapeHtml(barcode) + '</div></div>'
+    + (c.type ? '<div class="cat-badge">' + escapeHtml(c.type) + '</div>' : '') + '</div>'
+    + '<div class="item-fields"><div class="field"><div class="field-label">Wholesale Case Price</div><div class="field-val price">$' + (c.casePrice || 0).toFixed(2) + '</div></div>'
+    + '<div class="field"><div class="field-label">Wholesale Unit Price</div><div class="field-val price" style="font-size:18px;color:var(--accent2)">$' + (c.unitPrice || 0).toFixed(2) + '</div></div></div>';
+  const zone = document.getElementById('scan-zone');
+  zone.classList.remove('flash-error'); zone.classList.add('flash-success');
+  setTimeout(() => zone.classList.remove('flash-success'), 500);
+  barcodeInput.value = '';
+  barcodeInput.focus();
 }
 
 // ---- Multi-order management (Airtable-backed, syncs across devices) ----
@@ -1156,7 +1199,7 @@ async function fetchOrder(o) {
     const data = await res.json();
     for (const rec of data.records) {
       const it = itemFromRecord(rec);
-      built[it.barcode || rec.id] = it;
+      built[it.barcode ? dupKey(it.barcode, it.name) : rec.id] = it;
     }
     offset = data.offset;
   } while (offset);
